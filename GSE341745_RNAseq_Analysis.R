@@ -14,7 +14,7 @@ library(clusterProfiler)
 
 # 2. Import count data
 counts <- read_excel(
-  "/Users/ishitamondal/Downloads/GSE341745_merged_gene_counts.xlsx"
+  "data/GSE341745_merged_gene_counts.xlsx"
 )
 
 # Check dimensions and column names
