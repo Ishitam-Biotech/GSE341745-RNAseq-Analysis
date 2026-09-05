@@ -1,7 +1,5 @@
-# ============================================================
 # RNA-seq Analysis of GSE341745
 # Mouse neutrophil transcriptomic analysis
-# ============================================================
 
 # 1. Load required packages
 library(readxl)
@@ -12,77 +10,102 @@ library(org.Mm.eg.db)
 library(AnnotationDbi)
 library(clusterProfiler)
 
-# 2. Import count data
-counts <- read_excel(
-  "data/GSE341745_merged_gene_counts.xlsx"
-)
+# 2. Check project structure and import count data
 
-# Check dimensions and column names
-dim(counts)
-colnames(counts)
-# ============================================================
+input_file <- "data/GSE341745_merged_gene_counts.xlsx"
+if (!file.exists(input_file)) {
+ stop(
+ "Input file not found. Please run this script from the GitHub project root."
+ )
+}
+counts <- read_excel(input_file)
+# Basic input validation
+if (ncol(counts) < 3) {
+ stop("Input file must contain a Gene ID column and at least two sample columns.")
+}
+if (!"Gene ID" %in% colnames(counts)) {
+ stop("The first column must be named 'Gene ID'.")
+}
+
 # 3. Prepare expression matrix
-# ============================================================
 
 expr <- as.matrix(counts[, -1])
-
 rownames(expr) <- counts$`Gene ID`
+# Ensure expression values are numeric
+mode(expr) <- "numeric"
+if (anyNA(expr)) {
+ stop("Missing or non-numeric values detected in the expression matrix.")
+}
+# Check for duplicated gene IDs
+if (anyDuplicated(rownames(expr))) {
+ stop("Duplicated Gene IDs detected. Resolve duplicates before analysis.")
+}
 
-# Check dimensions
-dim(expr)
 
-
-# ============================================================
 # 4. Create sample metadata
-# ============================================================
 
 sample_names <- colnames(counts)[-1]
 
+condition <-  ifelse(
+  grepl("12h", sample_names, ignore.case = TRUE), 
+  "12h",
+  ifelse(
+     grepl("24h", sample_names, ignore.case = TRUE),
+     "24h",
+      NA
+    )
+)
+if (any(is.na(condition))) {
+  stop(
+    "Could not determine condition for sample(s): ",
+    paste(sample_names[is.na(condition)], collapse = ", ")
+  )
+}
+
 condition <- factor(
-  ifelse(grepl("12h", sample_names), "12h", "24h"),
+  condition,
   levels = c("12h", "24h")
 )
-
 sample_info <- data.frame(
   sample = sample_names,
   condition = condition
 )
+if (any(table(sample_info$condition) < 2)) {
+ stop("Each condition must contain at least two samples.")
+}
 
-# View sample information
-sample_info
-# ============================================================
-# 5. Filter low-expression genes
-# ============================================================
-
-cpm_expr <- cpm(expr)
-
-keep <- rowSums(cpm_expr >= 1) >= 4
-
-expr_filtered <- expr[keep, ]
-
-# Check how many genes remain
-dim(expr_filtered)
-
-
-# ============================================================
-# 6. TMM normalization
-# ============================================================
+# 5. Create DGEList and design matrix
 
 dge <- DGEList(
-  counts = expr_filtered,
-  group = sample_info$condition
+ counts = expr,
+ group = sample_info$condition
+)
+design <- model.matrix(
+ ~ condition,
+ data = sample_info
 )
 
+# 6. Filter low-expression genes
+
+keep <- filterByExpr(
+ dge,
+ design = design
+)
+dge <- dge[
+ keep,
+ ,
+ keep.lib.sizes = FALSE
+]
+
+
+# 7. TMM normalization
 dge <- calcNormFactors(
-  dge,
-  method = "TMM"
+ dge,
+ method = "TMM"
 )
 
-# View normalization information
-dge$samples
-# ============================================================
-# 7. PCA - Principal Component Analysis
-# ============================================================
+
+# 8. PCA - Principal Component Analysis
 
 logCPM <- cpm(
   dge,
@@ -95,35 +118,29 @@ pca <- prcomp(
   scale. = FALSE
 )
 
-# PCA plot
+percent_var <- 100 * (pca$sdev^2 / sum(pca$sdev^2))
 pca_df <- data.frame(
-  PC1 = pca$x[, 1],
-  PC2 = pca$x[, 2],
-  condition = sample_info$condition,
-  sample = sample_info$sample
+ PC1 = pca$x[, 1],
+ PC2 = pca$x[, 2],
+ condition = sample_info$condition,
+ sample = sample_info$sample
 )
-
-ggplot(
-  pca_df,
-  aes(x = PC1, y = PC2, label = sample)
+pca_plot <- ggplot(
+ pca_df,
+ aes(x = PC1, y = PC2, label = sample)
 ) +
-  geom_point(size = 4) +
-  geom_text(vjust = -1) +
-  labs(
-    title = "PCA of RNA-seq Samples",
-    x = "PC1",
-    y = "PC2"
-  ) +
-  theme_minimal()
-# ============================================================
-# 8. Differential Expression Analysis
-#    Comparison: 24 h vs 12 h
-# ============================================================
+ geom_point(size = 4) +
+ geom_text(vjust = -1) +
+ labs(
+ title = "PCA of RNA-seq Samples",
+ x = paste0("PC1 (", round(percent_var[1], 1), "%)"),
+ y = paste0("PC2 (", round(percent_var[2], 1), "%)")
+ ) +
+ theme_minimal()
 
-design <- model.matrix(
-  ~ condition,
-  data = sample_info
-)
+
+# 9. Differential Expression Analysis
+#    Comparison: 24 h vs 12 h
 
 # Estimate dispersion
 dge <- estimateDisp(
@@ -149,28 +166,18 @@ deg_results <- topTags(
   n = Inf
 )$table
 
-# View top DEGs
-head(deg_results)
-# ============================================================
-# 9. Identify Significant DEGs
+
+# 10. Identify Significant DEGs
 #    Criteria: FDR < 0.05 and |log2FC| >= 1
-# ============================================================
 
 deg_sig <- deg_results[
   deg_results$FDR < 0.05 &
     abs(deg_results$logFC) >= 1,
 ]
 
-# Count significant DEGs
-nrow(deg_sig)
-
-# Count upregulated and downregulated genes
-sum(deg_sig$logFC >= 1)
-sum(deg_sig$logFC <= -1)
-
 
 # ============================================================
-# 10. Volcano Plot
+# 11. Volcano Plot
 # ============================================================
 
 deg_results$significance <- "Not significant"
@@ -185,84 +192,123 @@ deg_results$significance[
     deg_results$logFC <= -1
 ] <- "Downregulated"
 
-ggplot(
-  deg_results,
-  aes(x = logFC, y = -log10(FDR), color = significance)
+# Protect against -log10(0)
+deg_results$plot_FDR <- pmax(
+ deg_results$FDR,
+ .Machine$double.xmin
+)
+volcano_plot <- ggplot(
+ deg_results,
+ aes(
+ x = logFC,
+ y = -log10(plot_FDR),
+ color = significance
+ )
 ) +
-  geom_point(alpha = 0.6, size = 1.5) +
-  geom_vline(
-    xintercept = c(-1, 1),
-    linetype = "dashed"
-  ) +
-  geom_hline(
-    yintercept = -log10(0.05),
-    linetype = "dashed"
-  ) +
-  labs(
-    title = "Differential Gene Expression: 24 h vs 12 h",
-    x = "Log2 Fold Change",
-    y = "-Log10 FDR"
-  ) +
-  theme_minimal()
-# ============================================================
-# 11. Heatmap of Top 50 Differentially Expressed Genes
-# ============================================================
+ geom_point(alpha = 0.6, size = 1.5) +
+ geom_vline(
+ xintercept = c(-1, 1),
+ linetype = "dashed"
+ ) +
+ geom_hline(
+ yintercept = -log10(0.05),
+ linetype = "dashed"
+ ) +
+ labs(
+ title = "Differential Gene Expression: 24 h vs 12 h",
+ x = "Log2 Fold Change",
+ y = "-Log10 FDR"
+ ) +
+ theme_minimal()
 
-top50_genes <- rownames(
-  deg_results[
-    order(deg_results$FDR),
-  ][1:50, ]
+# 12. Heatmap of Top 50 Differentially Expressed Genes
+
+sig_for_heatmap <- deg_results[
+ deg_results$FDR < 0.05 &
+ abs(deg_results$logFC) >= 1,
+]
+n_top <- min(50, nrow(sig_for_heatmap))
+if (n_top > 0) {
+ top_genes <- rownames(
+ sig_for_heatmap[
+ order(sig_for_heatmap$FDR),
+ ][seq_len(n_top), ]
+ )
+ heatmap_data <- logCPM[
+ top_genes,
+ ,
+ drop = FALSE
+ ]
+ pheatmap(
+ heatmap_data,
+ scale = "row",
+ clustering_distance_rows = "euclidean",
+ clustering_distance_cols = "euclidean",
+ clustering_method = "complete",
+ main = paste0("Top ", n_top, " Significant DEGs")
+ )
+}
+
+# 13. Annotate Ensembl Gene IDs with Gene Symbols
+
+ensembl_ids <- sub(
+ "\\..*$",
+ "",
+ rownames(deg_sig)
 )
-
-heatmap_data <- logCPM[top50_genes, ]
-
-pheatmap(
-  heatmap_data,
-  scale = "row",
-  clustering_distance_rows = "euclidean",
-  clustering_distance_cols = "euclidean",
-  clustering_method = "complete",
-  main = "Top 50 Differentially Expressed Genes"
-)
-# ============================================================
-# 12. Annotate Ensembl Gene IDs with Gene Symbols
-# ============================================================
-
 id_map <- mapIds(
-  org.Mm.eg.db,
-  keys = rownames(deg_sig),
-  keytype = "ENSEMBL",
-  column = "SYMBOL",
-  multiVals = "first"
+ org.Mm.eg.db,
+ keys = ensembl_ids,
+ keytype = "ENSEMBL",
+ column = "SYMBOL",
+ multiVals = "first"
+)
+names(id_map) <- rownames(deg_sig)
+deg_sig$GeneSymbol <- id_map[
+ rownames(deg_sig)
+]
+deg_annotated <- deg_sig[
+ !is.na(deg_sig$GeneSymbol) &
+ deg_sig$GeneSymbol != "",
+]
+# Remove duplicate symbols for downstream gene-list analyses
+deg_annotated_unique <- deg_annotated[
+ !duplicated(deg_annotated$GeneSymbol),
+]
+# Separate upregulated and downregulated genes
+up_genes <- unique(
+ deg_annotated_unique[
+ deg_annotated_unique$logFC >= 1,
+ "GeneSymbol"
+ ]
+)
+down_genes <- unique(
+ deg_annotated_unique[
+ deg_annotated_unique$logFC <= -1,
+ "GeneSymbol"
+ ]
 )
 
-deg_sig$GeneSymbol <- id_map[rownames(deg_sig)]
+# 14. Prepare enrichment background/universe
+# Background = genes retained after expression filtering
 
-# Keep genes with recognized symbols
-deg_annotated <- deg_sig[
-  !is.na(deg_sig$GeneSymbol) &
-    deg_sig$GeneSymbol != "",
-]
+filtered_ensembl <- sub(
+ "\\..*$",
+ "",
+ rownames(dge)
+)
+background_symbols <- mapIds(
+ org.Mm.eg.db,
+ keys = filtered_ensembl,
+ keytype = "ENSEMBL",
+ column = "SYMBOL",
+ multiVals = "first"
+)
+background_symbols <- unique(
+ na.omit(background_symbols)
+)
 
-# Separate upregulated and downregulated genes
-up_genes <- deg_annotated[
-  deg_annotated$logFC >= 1,
-  "GeneSymbol"
-]
-
-down_genes <- deg_annotated[
-  deg_annotated$logFC <= -1,
-  "GeneSymbol"
-]
-
-# Check numbers
-length(up_genes)
-length(down_genes)
-
-head(deg_annotated)
-# ============================================================
-# 13. GO Biological Process Enrichment
-# ============================================================
+# 15. GO Biological Process Enrichment
 
 ego_up <- enrichGO(
   gene = up_genes,
@@ -306,15 +352,26 @@ dotplot(
   showCategory = 15,
   title = "GO Biological Process Enrichment - Downregulated Genes"
 )
-# ============================================================
-# 15. KEGG Pathway Enrichment - Upregulated Genes
-# ============================================================
+
+# 16. KEGG Pathway Enrichment - Upregulated Genes
+# Analysis retained for upregulated genes as in original workflow
 
 kegg_up <- bitr(
   up_genes,
   fromType = "SYMBOL",
   toType = "ENTREZID",
   OrgDb = org.Mm.eg.db
+)
+
+background_entrez <- bitr(
+ filtered_ensembl,
+ fromType = "ENSEMBL",
+ toType = "ENTREZID",
+ OrgDb = org.Mm.eg.db
+)$ENTREZID
+
+background_entrez <- unique(
+ na.omit(background_entrez)
 )
 
 ekegg_up <- enrichKEGG(
@@ -325,22 +382,8 @@ ekegg_up <- enrichKEGG(
   qvalueCutoff = 0.05
 )
 
-# View top KEGG pathways
-head(as.data.frame(ekegg_up), 10)
-
-
-# ============================================================
-# 16. KEGG Enrichment Plot
-# ============================================================
-
-dotplot(
-  ekegg_up,
-  showCategory = 15,
-  title = "KEGG Pathway Enrichment - Upregulated Genes"
-)
-# ============================================================
 # 17. Prepare Ranked Gene List for GSEA
-# ============================================================
+#     Ranking metric: log2 fold change
 
 gene_rank <- data.frame(
   GeneID = rownames(deg_results),
@@ -350,6 +393,12 @@ gene_rank <- data.frame(
 gene_rank <- gene_rank[
   !is.na(gene_rank$logFC),
 ]
+
+gene_rank$GeneID <- sub(
+ "\\..*$",
+ "",
+ gene_rank$GeneID
+)
 
 gene_rank_entrez <- bitr(
   gene_rank$GeneID,
@@ -365,24 +414,25 @@ gene_rank_entrez <- merge(
   by.y = "GeneID"
 )
 
-# Remove duplicate Entrez IDs
+# Retain the strongest absolute logFC when multiple
+# Ensembl IDs map to the same Entrez ID
 gene_rank_entrez <- gene_rank_entrez[
-  !duplicated(gene_rank_entrez$ENTREZID),
+ order(
+ abs(gene_rank_entrez$logFC),
+ decreasing = TRUE
+ ),
 ]
-
-# Create ranked gene list
+gene_rank_entrez <- gene_rank_entrez[
+ !duplicated(gene_rank_entrez$ENTREZID),
+]
 gene_list <- gene_rank_entrez$logFC
 names(gene_list) <- gene_rank_entrez$ENTREZID
-
 gene_list <- sort(
-  gene_list,
-  decreasing = TRUE
+ gene_list,
+ decreasing = TRUE
 )
 
-
-# ============================================================
 # 18. GSEA - GO Biological Process
-# ============================================================
 
 gsea_go <- gseGO(
   geneList = gene_list,
@@ -400,50 +450,34 @@ gsea_go <- gseGO(
 head(as.data.frame(gsea_go), 10)
 
 
-# ============================================================
-# 19. GSEA Plot
-# ============================================================
+# 19. Prepare Top 50 Upregulated Genes for PPI Analysis
+#     This script prepares gene lists; STRING network analysis
+#     is performed externally unless separately documented.
 
-dotplot(
-  gsea_go,
-  showCategory = 15,
-  title = "GSEA - GO Biological Processes"
-)
-# ============================================================
-# 20. Prepare Top 50 Upregulated Genes for PPI Analysis
-# ============================================================
-
-top50_up <- deg_annotated[
-  deg_annotated$logFC >= 1,
+top50_up <- deg_annotated_unique[
+ deg_annotated_unique$logFC >= 1,
 ]
-
 top50_up <- top50_up[
-  order(top50_up$FDR),
-][1:50, ]
-
-ppi_genes <- top50_up$GeneSymbol
-
-ppi_genes
-
-
-# ============================================================
-# 21. Prepare Top 50 Downregulated Genes for PPI Analysis
-# ============================================================
-
-top50_down <- deg_annotated[
-  deg_annotated$logFC <= -1,
+ order(top50_up$FDR),
 ]
-
+top50_up <- head(top50_up, 50)
+ppi_genes <- unique(
+ top50_up$GeneSymbol
+)
+top50_down <- deg_annotated_unique[
+ deg_annotated_unique$logFC <= -1,
+]
 top50_down <- top50_down[
-  order(top50_down$FDR),
-][1:50, ]
+ order(top50_down$FDR),
+]
+top50_down <- head(top50_down, 50)
+ppi_genes_down <- unique(
+ top50_down$GeneSymbol
+)
 
-ppi_genes_down <- top50_down$GeneSymbol
 
-ppi_genes_down
-# ============================================================
-# 22. Create Results Directory
-# ============================================================
+# 20. Create Results Directory
+
 
 dir.create(
   "RNAseq_results",
@@ -451,9 +485,7 @@ dir.create(
 )
 
 
-# ============================================================
-# 23. Save Differential Expression Results
-# ============================================================
+# 21. Save Differential Expression Results
 
 write.csv(
   deg_results,
@@ -469,7 +501,7 @@ write.csv(
 
 
 # ============================================================
-# 24. Save GO Enrichment Results
+# 22. Save GO Enrichment Results
 # ============================================================
 
 write.csv(
@@ -485,9 +517,7 @@ write.csv(
 )
 
 
-# ============================================================
-# 25. Save KEGG Enrichment Results
-# ============================================================
+# 23. Save KEGG Enrichment Results
 
 write.csv(
   as.data.frame(ekegg_up),
@@ -496,9 +526,7 @@ write.csv(
 )
 
 
-# ============================================================
-# 26. Save GSEA Results
-# ============================================================
+# 24. Save GSEA Results
 
 write.csv(
   as.data.frame(gsea_go),
@@ -508,7 +536,7 @@ write.csv(
 
 
 # ============================================================
-# 27. Save PPI Gene Lists
+# 25. Save PPI Gene Lists
 # ============================================================
 
 write.table(
@@ -526,24 +554,10 @@ write.table(
   col.names = FALSE,
   quote = FALSE
 )
-# ============================================================
+
 # 28. Save Important Figures
-# ============================================================
 
-# PCA plot
-pca_plot <- ggplot(
-  pca_df,
-  aes(x = PC1, y = PC2, label = sample)
-) +
-  geom_point(size = 4) +
-  geom_text(vjust = -1) +
-  labs(
-    title = "PCA of RNA-seq Samples",
-    x = "PC1",
-    y = "PC2"
-  ) +
-  theme_minimal()
-
+#PCA plot
 ggsave(
   "RNAseq_results/PCA_plot.pdf",
   pca_plot,
@@ -551,27 +565,7 @@ ggsave(
   height = 6
 )
 
-
 # Volcano plot
-volcano_plot <- ggplot(
-  deg_results,
-  aes(x = logFC, y = -log10(FDR), color = significance)
-) +
-  geom_point(alpha = 0.6, size = 1.5) +
-  geom_vline(
-    xintercept = c(-1, 1),
-    linetype = "dashed"
-  ) +
-  geom_hline(
-    yintercept = -log10(0.05),
-    linetype = "dashed"
-  ) +
-  labs(
-    title = "Differential Gene Expression: 24 h vs 12 h",
-    x = "Log2 Fold Change",
-    y = "-Log10 FDR"
-  ) +
-  theme_minimal()
 
 ggsave(
   "RNAseq_results/Volcano_plot.pdf",
@@ -580,8 +574,8 @@ ggsave(
   height = 6
 )
 
-
 # GO plots
+if (nrow(as.data.frame(ego_up)) > 0) {
 pdf(
   "RNAseq_results/GO_Upregulated_dotplot.pdf",
   width = 9,
@@ -595,10 +589,10 @@ print(
     title = "GO Biological Process Enrichment - Upregulated Genes"
   )
 )
-
 dev.off()
+}
 
-
+if (nrow(as.data.frame(ego_down)) > 0) {
 pdf(
   "RNAseq_results/GO_Downregulated_dotplot.pdf",
   width = 9,
@@ -614,9 +608,10 @@ print(
 )
 
 dev.off()
-
+}
 
 # KEGG plot
+if (nrow(as.data.frame(ekegg_up)) > 0) {
 pdf(
   "RNAseq_results/KEGG_Upregulated_dotplot.pdf",
   width = 9,
@@ -632,9 +627,10 @@ print(
 )
 
 dev.off()
-
+}
 
 # GSEA plot
+if (nrow(as.data.frame(gsea_go)) > 0) {
 pdf(
   "RNAseq_results/GSEA_GO_dotplot.pdf",
   width = 9,
@@ -650,9 +646,9 @@ print(
 )
 
 dev.off()
-# ============================================================
-# 29. Final Analysis Summary
-# ============================================================
+  }
+
+# 27. Final Analysis Summary
 
 cat("RNA-seq Analysis Summary\n")
 cat("========================\n")
@@ -677,3 +673,9 @@ print(head(
 ))
 
 cat("\nAnalysis completed successfully.\n")
+
+# Save reproducibility information
+writeLines(
+ capture.output(sessionInfo()),
+ "RNAseq_results/sessionInfo.txt"
+)
